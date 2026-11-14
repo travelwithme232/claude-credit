@@ -1,0 +1,751 @@
+#!/usr/bin/env python3
+# credit: continue this folder's Claude Code conversations with `claude -p`,
+# paid from the monthly API credit (promotional credit) of Max / Ultra / Team plans.
+# Standard library only, except the `keyring` package on Windows.
+# macOS: login keychain via `security`. Windows: Credential Manager via `keyring`.
+import getpass, json, os, re, shutil, subprocess, sys, time
+
+WIN = sys.platform == "win32"
+MAC = sys.platform == "darwin"
+TOOLS = "Read,Edit,Write,Bash"
+SERVICE = os.environ.get("CREDIT_KEYCHAIN_SERVICE", "claude-credit")  # keychain item name
+BILLING_URL = "https://platform.claude.com/settings/billing"
+MODELS = {"opus": "opus", "sonnet": "sonnet", "fable": "claude-fable-5-1"}
+DEFAULT_MODEL = "opus"
+CLAUDE_DIR = os.path.join(os.path.expanduser("~"), ".claude")
+CREDIT_DIR = os.path.join(CLAUDE_DIR, "credit")
+SPEND_FILE = os.path.join(CREDIT_DIR, "spend.json")
+CONFIG_FILE = os.path.join(CREDIT_DIR, "config.json")
+RUN_FILE = os.path.join(CREDIT_DIR, "run-sessions.json")  # folder -> conversation used by `credit run`
+CONFIG_DEFAULTS = {
+    "model": "auto",           # auto = the conversation's last model, else opus
+    "max_per_message": 10.0,   # USD cap for one message
+}
+KEY_RE = r"sk-ant-[A-Za-z0-9_\-]+"
+NO_CREDIT_EXIT = 3
+BAD_KEY_EXIT = 4
+
+TEXT = {
+    "en": {
+        "untitled": "untitled",
+        "this": "this ${:.2f}",
+        "month": "this month ${:.2f}",
+        "no_credit": ("The credit is used up (or expired). It comes back on your next billing date.\n"
+                      "Remaining credit: " + BILLING_URL),
+        "run_usage": 'Usage: credit run "message" [--new] [--model opus|sonnet|fable]',
+        "no_keyring": "The `keyring` package is needed on Windows: py -m pip install --user keyring",
+        "see_help": "More: credit help",
+        "s_fable": "Warning: the default model is fable, which costs 2.5x opus.",
+        "md_bad": "~/.claude/CLAUDE.md is not UTF-8 text, so it was left unchanged.",
+        "md_marker": "~/.claude/CLAUDE.md has <!-- credit:start --> without <!-- credit:end -->; fix it by hand. Nothing changed.",
+        "guide": (
+            "credit runs `claude -p` on the monthly API credit (promotional credit) of Claude Max, Ultra and Team\n"
+            "plans. In Claude Code, just say \"use credit\": the task runs on the credit\n"
+            "in the background, and you get the reply and the cost.\n\n"
+            "Who gets the credit (as of Nov 2026)\n"
+            "  Claude Max, Ultra or Team plan (not Pro), from 7 days after subscribing.\n\n"
+            "Getting the credit (once; then it arrives every month)\n"
+            "  On the claude.ai website (not the app): Settings > Billing > API credits, and connect your Claude Console\n"
+            "  account (the Console calls it an \"organization\"; for one person it's just your account).\n\n"
+            "Console setting you must make\n"
+            "  Auto-reload off: nothing is charged automatically, and when the credit runs out, it simply stops.\n"
+            "  " + BILLING_URL + "\n\n"
+            "Commands\n"
+        ),
+        "guide_end": (
+            "\nCosts\n"
+            "  - A long conversation re-sends its history: one message can cost a few dollars.\n"
+            "  - The prompt cache lasts about 5 minutes: continuing within 5 minutes is much cheaper.\n"
+            "  - Models differ a lot in price; sonnet costs less than opus.\n\n"
+            "Prices per 1M tokens (Nov 2026, may change: https://platform.claude.com/docs/en/about-claude/pricing)\n"
+            "               input  output  cache read\n"
+            "  Fable 5.1    $10    $50     $0.25\n"
+            "  Opus 5.5     $4     $20     $0.20\n"
+            "  Sonnet 5.5   $2     $10     $0.10\n"
+            "  Fable costs 2.5x Opus; opus is the usual pick.\n"
+            "  Example: continuing a long conversation (~250K tokens) for the first time, or after more than 5 minutes,\n"
+            "  costs about $3 just to read it on Fable, about $1.3 on Opus; within 5 minutes, a few cents.\n\n"
+            "Removing\n"
+            "  credit uninstall\n"
+        ),
+        "un_confirm": "Remove credit, its settings and spending log, the API key and the VS Code rule? [y/N] ",
+        "un_none": "Nothing removed.",
+        "un_done": "Removed:",
+        "un_rule": "credit block in ~/.claude/CLAUDE.md",
+        "un_key": "API key (" + SERVICE + ")",
+        "no_reply": "No new reply",
+        "you": "Me",
+        "reply": "Reply",
+        "no_claude": "`claude` not found. Install Claude Code first.",
+        "setup": (
+            "credit uses your plan's monthly API credit (promotional credit) through an API key.\n"
+            "In the Claude Console organization, turn auto-reload off first: nothing is charged automatically,\n"
+            "and when the credit runs out, it simply stops.\n"
+            "  " + BILLING_URL + "\n"
+            "Create an API key in the same organization.\n"
+        ),
+        "key_prompt": "API key (hidden): ",
+        "key_bad": "That doesn't look like an API key (sk-ant-...). Nothing saved.",
+        "key_saved": "Saved to the keychain.\n",
+        "key_fail": "Couldn't save to the keychain.",
+        "help": (
+            "Use: in Claude Code, just say \"use credit\" (e.g. \"use credit to fix this bug\").\n"
+            "  Each project folder keeps one conversation that continues. To start over, say \"use credit, new conversation\".\n"
+            "  A long conversation costs more per message, so start a new one when a job is done.\n\n"
+            "credit                         status: spent this month, settings, key\n"
+            "credit key                     check auto-reload is off, then enter the API key (hidden)\n"
+            "credit set cap|model VALUE     optional, the defaults work fine:\n"
+            "                                 cap = most one message may spend (default $10; it stops past that)\n"
+            "                                 model = auto (the conversation's last model, opus at first) | opus | sonnet | fable\n"
+            "credit help                    what credit is, setup, costs\n"
+            "credit uninstall               remove credit, its settings, key and VS Code rule\n"
+        ),
+        "s_title": "credit — monthly API credit for claude -p",
+        "s_month": "Spent this month", "s_cap": "Cap / message", "s_model": "Default model",
+        "s_vscode": "VS Code", "s_key": "API key", "s_on": "on", "s_off": "off", "s_saved": "saved",
+        "s_missing": "missing — run: credit key",
+        "s_console": "Remaining credit (Console)",
+        "c1": "Auto-reload is off",
+        "confirm": "  {}? [y/N] ", "confirm_fail": "Set that up on the Console first: " + BILLING_URL,
+        "need_key": "No API key yet. Run: credit key",
+        "bad_key": "The API key is wrong or was deleted on the Console. Enter a new one: credit key",
+        "set_usage": "Usage: credit set cap AMOUNT  or  credit set model auto|opus|sonnet|fable",
+        "set_done": "Saved: {} = {}",
+    },
+    "ko": {
+        "untitled": "제목 없음",
+        "this": "이번 {:.2f}불",
+        "month": "이번 달 {:.2f}불",
+        "no_credit": ("크레딧을 다 썼어요(또는 만료됐어요). 다음 결제일에 다시 들어와요.\n"
+                      "남은 크레딧: " + BILLING_URL),
+        "run_usage": '쓰는 법: credit run "할 말" [--new] [--model opus|sonnet|fable]',
+        "no_keyring": "윈도우에서는 keyring 패키지가 필요해요: py -m pip install --user keyring",
+        "see_help": "자세히: credit help",
+        "s_fable": "주의: 기본 모델이 fable 이에요. opus 의 2.5배 값이에요.",
+        "md_bad": "~/.claude/CLAUDE.md 가 UTF-8 글이 아니라서 건드리지 않았어요.",
+        "md_marker": "~/.claude/CLAUDE.md 에 <!-- credit:start --> 만 있고 <!-- credit:end --> 가 없어요. 직접 고쳐 주세요. 아무것도 안 바꿨어요.",
+        "guide": (
+            "credit 은 Claude Max·Ultra·Team 요금제의 월 API 크레딧(프로모션 크레딧)으로 `claude -p` 를 돌리고,\n"
+            "Claude Code 채팅에서 \"credit 써서 해줘\"라고만 하면\n"
+            "크레딧으로 뒤에서 돌리고, 끝나면 답과 쓴 금액을 알려 줘요.\n\n"
+            "받을 수 있는 사람 (2026년 11월 기준)\n"
+            "  Claude Max·Ultra·Team 요금제 (Pro 는 안 돼요), 가입하고 7일 뒤부터.\n\n"
+            "크레딧 받는 법 (처음 한 번만, 그 뒤로는 매달 자동으로 들어와요)\n"
+            "  claude.ai 웹사이트(앱 아님) > 설정 > 결제 > API 크레딧에서 내 Claude Console 계정을 연결하세요.\n"
+            "  (Console 에서는 \"조직\"이라고 불러요. 혼자 쓰면 그냥 내 계정이에요.)\n\n"
+            "Console 에서 꼭 할 설정\n"
+            "  자동 충전 꺼짐: 저절로 돈이 나가지 않고, 크레딧을 다 쓰면 그냥 멈춥니다.\n"
+            "  " + BILLING_URL + "\n\n"
+            "명령\n"
+        ),
+        "guide_end": (
+            "\n비용 주의\n"
+            "  - 긴 대화는 지난 내용을 다시 보내서 메시지 한 번에 몇 불이 들 수 있어요.\n"
+            "  - 프롬프트 캐시는 5분쯤 가요. 5분 안에 이어 쓰면 훨씬 쌉니다.\n"
+            "  - 모델마다 값 차이가 커요. sonnet 이 opus 보다 쌉니다.\n\n"
+            "요금 (100만 토큰당, 2026-11 기준, 바뀔 수 있음: https://platform.claude.com/docs/en/about-claude/pricing)\n"
+            "               입력   출력    캐시 읽기\n"
+            "  Fable 5.1    10불   50불    0.25불\n"
+            "  Opus 5.5     4불    20불    0.20불\n"
+            "  Sonnet 5.5   2불    10불    0.10불\n"
+            "  페이블은 오퍼스의 2.5배예요. 평소엔 opus 를 추천해요.\n"
+            "  예: 긴 대화(약 25만 토큰)를 처음(또는 5분 넘게 쉬고) 이어 쓰면 읽는 값만 페이블 약 3불, 오퍼스 약 1.3불.\n"
+            "  5분 안이면 몇 센트예요.\n\n"
+            "지우기\n"
+            "  credit uninstall\n"
+        ),
+        "un_confirm": "credit 과 설정·쓴 금액 기록·API 키·VS Code 규칙을 지울까요? [y/N] ",
+        "un_none": "아무것도 안 지웠어요.",
+        "un_done": "지운 것:",
+        "un_rule": "~/.claude/CLAUDE.md 의 credit 부분",
+        "un_key": "API 키 (" + SERVICE + ")",
+        "no_reply": "새 답장 없음",
+        "you": "나",
+        "reply": "답장",
+        "no_claude": "claude 명령이 없어요. Claude Code 를 먼저 설치하세요.",
+        "setup": (
+            "credit 은 요금제의 월 API 크레딧(프로모션 크레딧)을 API 키로 씁니다.\n"
+            "Claude Console 조직에서 먼저 자동 충전을 꺼 두세요. 저절로 돈이 나가지 않고,\n"
+            "크레딧을 다 쓰면 그냥 멈춥니다.\n"
+            "  " + BILLING_URL + "\n"
+            "같은 조직에서 API 키를 만드세요.\n"
+        ),
+        "key_prompt": "API 키 (안 보임): ",
+        "key_bad": "API 키 모양(sk-ant-...)이 아니에요. 저장 안 했어요.",
+        "key_saved": "키체인에 저장했어요.\n",
+        "key_fail": "키체인에 저장하지 못했어요.",
+        "help": (
+            "쓰는 법: Claude Code 채팅에서 \"credit 써서 해줘\"라고 하면 돼요 (예: \"credit 써서 이 버그 고쳐줘\").\n"
+            "  프로젝트 폴더마다 대화 하나가 계속 이어져요. 새로 시작하려면 \"credit 새 대화로 해줘\".\n"
+            "  대화가 길수록 한 번에 비싸지니, 일이 끝나면 새 대화로 시작하세요.\n\n"
+            "credit                         상태: 이번 달 쓴 금액·설정·키\n"
+            "credit key                     자동 충전 꺼짐 확인 후 API 키 넣기 (안 보임)\n"
+            "credit set cap|model 값        안 해도 됨 (기본값으로 잘 돌아가요):\n"
+            "                                 cap = 한 번에 쓸 수 있는 최대 금액 (기본 10불, 넘으면 멈춤)\n"
+            "                                 model = auto (그 대화에서 쓰던 모델, 처음이면 opus) | opus | sonnet | fable\n"
+            "credit help                    credit 설명·설정·비용\n"
+            "credit uninstall               credit 과 설정·키·VS Code 규칙 지우기\n"
+        ),
+        "s_title": "credit — claude -p 용 월 API 크레딧",
+        "s_month": "이번 달 쓴 금액", "s_cap": "메시지 상한", "s_model": "기본 모델",
+        "s_vscode": "VS Code 연동", "s_key": "API 키", "s_on": "켜짐", "s_off": "꺼짐", "s_saved": "있음",
+        "s_missing": "없음 — 실행: credit key",
+        "s_console": "남은 크레딧 (Console)",
+        "c1": "자동 충전이 꺼져 있다",
+        "confirm": "  {}? [y/N] ", "confirm_fail": "Console 에서 먼저 그렇게 해 두세요: " + BILLING_URL,
+        "need_key": "아직 API 키가 없어요. 실행: credit key",
+        "bad_key": "API 키가 틀렸거나 Console 에서 지워졌어요. 새 키를 넣어 주세요: credit key",
+        "set_usage": "쓰는 법: credit set cap 금액  또는  credit set model auto|opus|sonnet|fable",
+        "set_done": "저장: {} = {}",
+    },
+}
+
+
+def lang():
+    if MAC:
+        out = subprocess.run(["defaults", "read", "-g", "AppleLanguages"], capture_output=True, text=True)
+        m = re.search(r'"?([A-Za-z]{2})', out.stdout)
+        return "ko" if m and m.group(1).lower() == "ko" else "en"
+    if WIN:
+        import ctypes
+        return "ko" if ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF == 0x12 else "en"
+    return "ko" if (os.environ.get("LC_ALL") or os.environ.get("LANG") or "").lower().startswith("ko") else "en"
+
+
+LANG = lang()
+T = TEXT[LANG]
+
+
+def folder_id(folder=None):
+    return re.sub(r"[^A-Za-z0-9]", "-", folder or os.getcwd())
+
+
+def log_path(folder=None):
+    return os.path.join(CLAUDE_DIR, "credit-last", folder_id(folder) + ".md")
+
+
+# ---- conversation files ----
+
+def info(path):
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - 6_000_000))
+        lines = f.read().decode("utf8", "ignore").splitlines()
+    model = title = None
+    for line in reversed(lines):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if not model and r.get("type") == "assistant":
+            m = (r.get("message") or {}).get("model") or ""
+            if m.startswith("claude"):
+                model = m
+        if not title and r.get("type") == "ai-title":
+            title = r.get("aiTitle") or r.get("title")
+        if not title and r.get("type") == "last-prompt":
+            title = r.get("lastPrompt")
+        if model and title:
+            break
+    return model, " ".join((title or T["untitled"]).split())[:40]
+
+
+def take():
+    # /credit-result: print the last exchange once, then clear it
+    try:
+        with open(log_path(), encoding="utf8") as f:
+            print(f.read() or T["no_reply"])
+        os.remove(log_path())
+    except FileNotFoundError:
+        print(T["no_reply"])
+
+
+# ---- spending log (local; the remaining balance is only on the Console) ----
+
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf8") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def add_cost(last, sid, total):
+    # total_cost_usd of a --resume run is the whole conversation so far: count only the growth
+    prev = last.get(sid, 0.0) if sid else 0.0
+    if sid:
+        last[sid] = total
+    return total - prev if total >= prev else total
+
+
+def migrate_spend(rows):
+    # version 1 stored each run's total_cost_usd as is
+    data = {"version": 2, "last": {}, "entries": []}
+    for r in sorted(rows, key=lambda r: r.get("t", 0)):
+        cost = add_cost(data["last"], r.get("sid"), float(r.get("cost") or 0))
+        data["entries"].append({**r, "cost": round(cost, 6)})
+    return data
+
+
+def load_spend():
+    data = read_json(SPEND_FILE, None)
+    if isinstance(data, list):
+        data = migrate_spend(data)
+        write_json(SPEND_FILE, data)
+    if not isinstance(data, dict):
+        data = {}
+    if not isinstance(data.get("last"), dict):
+        data["last"] = {}
+    if not isinstance(data.get("entries"), list):
+        data["entries"] = []
+    data["version"] = 2
+    return data
+
+
+def record_spend(sid, title, model, total, folder=None, resumed=None):
+    # returns what this message cost
+    data = load_spend()
+    if resumed and sid != resumed and resumed in data["last"] and sid not in data["last"]:
+        data["last"][sid] = data["last"][resumed]
+    cost = add_cost(data["last"], sid, num(total))
+    data["entries"].append({"t": time.time(), "sid": sid, "title": title, "folder": folder or os.getcwd(),
+                            "model": model, "cost": round(cost, 6)})
+    write_json(SPEND_FILE, data)
+    return cost
+
+
+def num(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def spent_since(t0):
+    return sum(num(r.get("cost")) for r in load_spend()["entries"] if isinstance(r, dict) and num(r.get("t")) > t0)
+
+
+def this_month():
+    month = time.strftime("%Y-%m")
+    rows = [r for r in load_spend()["entries"]
+            if isinstance(r, dict) and time.strftime("%Y-%m", time.localtime(num(r.get("t")))) == month]
+    by_conv = {}
+    for r in rows:
+        c = by_conv.setdefault(r.get("sid") or "?", {**r, "cost": 0.0})
+        c["cost"] += num(r.get("cost"))
+        c["model"] = r.get("model") or c["model"]
+    convs = sorted(by_conv.values(), key=lambda c: c["cost"], reverse=True)
+    return sum(c["cost"] for c in convs), convs
+
+
+# ---- settings and the pre-send check ----
+
+def load_config():
+    cfg = read_json(CONFIG_FILE, {})
+    return {**CONFIG_DEFAULTS, **(cfg if isinstance(cfg, dict) else {})}
+
+
+def save_config(cfg):
+    write_json(CONFIG_FILE, {k: cfg.get(k, v) for k, v in CONFIG_DEFAULTS.items()})
+
+
+def check(cfg):
+    # -> (block message or None, budget for --max-budget-usd); running out is caught from the API reply
+    cap = num(cfg["max_per_message"], 10.0)
+    return (T["no_credit"], 0) if cap < 0.01 else (None, cap)
+
+
+def pick_model(name, session_model):
+    # `credit opus|sonnet|fable` / --model, then the config, then the conversation's last model, then opus
+    if name:
+        return MODELS.get(name, name)
+    cfg_model = load_config().get("model") or "auto"
+    if cfg_model != "auto":
+        return MODELS.get(cfg_model, cfg_model)
+    return session_model or MODELS[DEFAULT_MODEL]
+
+
+# ---- key ----
+
+def keyring():
+    try:
+        import keyring as kr
+        return kr
+    except ImportError:
+        sys.exit(T["no_keyring"])
+
+
+def read_key():
+    if WIN:
+        kr = keyring()
+        try:
+            return kr.get_password(SERVICE, getpass.getuser())
+        except Exception:
+            return None
+    out = subprocess.run(["security", "find-generic-password", "-a", getpass.getuser(), "-s", SERVICE, "-w"],
+                         capture_output=True, text=True)
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def save_key(key):
+    if not re.fullmatch(KEY_RE, key):
+        return False
+    if WIN:
+        keyring().set_password(SERVICE, getpass.getuser(), key)
+        return read_key() == key
+    # through `security -i` stdin, so the key never shows up in the process list
+    cmd =f'add-generic-password -U -a "{getpass.getuser()}" -s "{SERVICE}" -w "{key}"\n'
+    out = subprocess.run(["security", "-i"], input=cmd, capture_output=True, text=True)
+    return out.returncode == 0 and read_key() == key
+
+
+def confirm_console():
+    print(T["setup"])
+    for c in ("c1",):
+        if input(T["confirm"].format(T[c])).strip().lower() not in ("y", "yes"):
+            sys.exit(T["confirm_fail"])
+
+
+def ask_key():
+    key = getpass.getpass(T["key_prompt"]).strip()
+    if not re.fullmatch(KEY_RE, key):
+        sys.exit(T["key_bad"])
+    return key
+
+
+def set_key():
+    confirm_console()
+    if not save_key(ask_key()):
+        sys.exit(T["key_fail"])
+    print(T["key_saved"])
+
+
+def get_key():
+    key = read_key()
+    if not key:
+        sys.exit(T["need_key"])
+    return key
+
+
+# ---- talking ----
+
+class BadKey(Exception):
+    pass
+
+
+class NoCredit(Exception):
+    pass
+
+
+def clean_env(key):
+    # Like `env -i`: if VS Code's variables leak in, claude runs on the subscription instead of the key.
+    # No --bare either: it drops the credit.
+    if WIN:
+        names = ("SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATH", "PATHEXT", "TEMP", "TMP",
+                 "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "USERNAME",
+                 "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE")
+        keep = {k: os.environ[k] for k in names if k in os.environ}
+    else:
+        keep = {k: os.environ[k] for k in ("HOME", "USER", "LOGNAME", "PATH") if k in os.environ}
+        keep.update(SHELL=os.environ.get("SHELL", "/bin/zsh"), TERM="xterm-256color",
+                    LANG=os.environ.get("LANG", "en_US.UTF-8"))
+    keep["ANTHROPIC_API_KEY"] = key
+    return keep
+
+
+def claude_exe():
+    exe = (WIN and shutil.which("claude.exe")) or shutil.which("claude")
+    if not exe:
+        sys.exit(T["no_claude"])
+    return exe
+
+
+def call_claude(key, sid, model, text, budget, folder=None):
+    exe = claude_exe()
+    cmd = [exe, "-p", "--model", model, "--allowedTools", TOOLS, "--max-budget-usd", f"{budget:.2f}",
+           "--output-format", "json"]
+    if sid:
+        cmd += ["--resume", sid]
+    # a .cmd shim goes through cmd.exe, which mangles arguments: give it the message on stdin instead
+    via_stdin = exe.lower().endswith((".cmd", ".bat"))
+    # a full env= replaces the environment like `env -i`, and keeps the key out of argv
+    out = subprocess.run(cmd if via_stdin else cmd + [text], input=text if via_stdin else None,
+                         env=clean_env(key), cwd=folder, capture_output=True, text=True, encoding="utf8", errors="replace")
+    try:
+        r = json.loads(out.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        r = None
+    if not isinstance(r, dict) or r.get("is_error"):
+        said = (out.stdout + out.stderr).lower()
+        if "credit balance is too low" in said:
+            raise NoCredit(T["no_credit"])
+        if "invalid api key" in said or "authentication_error" in said or "invalid x-api-key" in said:
+            raise BadKey(T["bad_key"])
+        # any other failure is not a reply: show it and don't record a cost
+        msg = r.get("result") if isinstance(r, dict) else None
+        print(msg or out.stdout or out.stderr, file=sys.stderr)
+        return None
+    return r
+
+
+def send(key, sid, model, title, text, folder=None):
+    # one message, with the cap. -> (session id, reply, cost) or None on failure
+    block, budget = check(load_config())
+    if block:
+        raise NoCredit(block)
+    r = call_claude(key, sid, model, text, budget, folder)
+    if r is None:
+        return None
+    reply = str(r.get("result") or r.get("subtype") or r)
+    os.makedirs(os.path.dirname(log_path(folder)), exist_ok=True)
+    with open(log_path(folder), "w", encoding="utf8") as f:
+        f.write(f"{T['you']}: {text}\n\n{T['reply']}: {reply}\n\n")
+    cost = record_spend(r.get("session_id") or sid, title, model, r.get("total_cost_usd", 0), folder, resumed=sid)
+    return r.get("session_id") or sid, reply, cost
+
+
+def cost_line(cost):
+    return T["this"].format(cost) + " · " + T["month"].format(this_month()[0])
+
+
+def session_model(sid, folder=None):
+    path = os.path.join(CLAUDE_DIR, "projects", folder_id(folder), f"{sid}.jsonl")
+    return info(path)[0] if sid and os.path.exists(path) else None
+
+
+def run(args):
+    # credit run "message" [--new] [--model X]: no chat; keeps one conversation per folder
+    text, new, name, i = None, False, None, 0
+    while i < len(args):
+        if args[i] == "--new":
+            new = True
+        elif args[i] == "--model" and i + 1 < len(args):
+            name = args[i + 1]
+            i += 1
+        elif text is None:
+            text = args[i]
+        i += 1
+    if not text or not text.strip():
+        sys.exit(T["run_usage"])
+    runs = read_json(RUN_FILE, {})
+    runs = runs if isinstance(runs, dict) else {}
+    sid = None if new else runs.get(folder_id())
+    model = pick_model(name, session_model(sid))
+    key = get_key()
+    try:
+        res = send(key, sid, model, " ".join(text.split())[:40], text)
+    except NoCredit as e:
+        print(e)
+        sys.exit(NO_CREDIT_EXIT)
+    except BadKey as e:
+        print(e)
+        sys.exit(BAD_KEY_EXIT)
+    if res is None:
+        sys.exit(1)
+    sid, reply, cost = res
+    runs[folder_id()] = sid
+    write_json(RUN_FILE, runs)
+    print(reply + "\n\n[" + cost_line(cost) + "]")
+
+
+# ---- VS Code integration (CLAUDE.md rule + /credit-result) ----
+
+MARK_START, MARK_END = "<!-- credit:start -->", "<!-- credit:end -->"
+RULE = {
+    "en": """## credit (hand work to the API credit)
+
+When the user says "use credit" (or "do it with credit"), don't do the task here; hand it over:
+- In the working folder, run `credit run "the task"` in the background (add `--new` when the user says "new conversation"). Wait for the notification.
+- When it ends, pass on only the reply and the cost line, briefly. Don't spend tokens re-checking the reply (no reading files or building) unless the user asks.
+- Exit code 3 means no credit: ask "There's no credit, so I can't hand it over. Shall I do it here?" and don't go ahead on your own.
+- Exit code 4 means the API key is wrong or deleted: tell the user to run `credit key` in a terminal, and don't do the task here.
+- Split big tasks and hand them over two or three items at a time.""",
+    "ko": """## credit (API 크레딧으로 넘기기)
+
+사용자가 "credit 써서 해줘"(또는 "credit 으로 해줘")라고 하면 그 작업을 여기서 하지 말고 넘긴다.
+- 작업 폴더에서 `credit run "시킬 내용"` 을 백그라운드로 돌린다(사용자가 "새 대화로"라고 하면 `--new`). 끝나면 알림이 오니 기다린다.
+- 끝나면 받은 답과 금액 줄만 짧게 전한다. 받은 답을 다시 검증하느라 파일을 읽거나 빌드하며 토큰을 쓰지 않는다(사용자가 하라고 할 때만).
+- exit 3 이면 크레딧이 없는 것이다: "크레딧이 없어서 못 넘겨요. 여기서 직접 할까요?" 라고 묻고, 맘대로 직접 하지 않는다.
+- exit 4 이면 API 키가 틀렸거나 지워진 것이다: 터미널에서 `credit key` 로 다시 넣으라고 알려 주고, 여기서 직접 하지 않는다.
+- 큰 작업은 두세 항목씩 나눠 넘긴다.""",
+}
+RESULT_COMMAND = """---
+description: Bring the last terminal `credit` exchange into this window
+allowed-tools: Bash(credit --take)
+---
+
+Below is what the user said in the terminal `credit` tool, continuing this conversation. Remember it and carry on from it.
+Use no tools. Print the text below exactly as is, without changing a character. Add nothing.
+
+!`credit --take`
+"""
+CLAUDE_MD = os.path.join(CLAUDE_DIR, "CLAUDE.md")
+RESULT_MD = os.path.join(CLAUDE_DIR, "commands", "credit-result.md")
+BLOCK_RE = re.compile(r"\n*" + re.escape(MARK_START) + r".*?" + re.escape(MARK_END) + r"\n?", re.S)
+
+
+def read_md():
+    # None if missing; exits (changing nothing) if it isn't UTF-8
+    try:
+        with open(CLAUDE_MD, encoding="utf8", newline="") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError:
+        sys.exit(T["md_bad"])
+
+
+def write_md(text):
+    tmp = CLAUDE_MD + ".credit-tmp"
+    with open(tmp, "w", encoding="utf8", newline="") as f:
+        f.write(text)
+    os.replace(tmp, CLAUDE_MD)
+
+
+def vscode_enabled():
+    try:
+        return MARK_START in (read_md() or "")
+    except SystemExit:
+        return False
+
+
+def vscode_on():
+    # adds (or refreshes) only the marked block; the rest of CLAUDE.md is left as it is
+    text = read_md() or ""
+    block = f"{MARK_START}\n{RULE[LANG]}\n{MARK_END}\n"
+    if MARK_START in text and not BLOCK_RE.search(text):
+        sys.exit(T["md_marker"])  # a start marker without an end: leave the file alone
+    if MARK_START in text:
+        text = BLOCK_RE.sub(lambda m: ("\n\n" if m.start() else "") + block, text, count=1)
+    else:
+        text = text + ("\n" if text and not text.endswith("\n") else "") + ("\n" if text else "") + block
+    os.makedirs(os.path.dirname(RESULT_MD), exist_ok=True)
+    write_md(text)
+    with open(RESULT_MD, "w", encoding="utf8") as f:
+        f.write(RESULT_COMMAND)
+
+
+def vscode_off():
+    text = read_md()
+    if text and BLOCK_RE.search(text):
+        rest = BLOCK_RE.sub("\n", text, count=1)
+        write_md(rest if rest.strip() else "")
+    if os.path.exists(RESULT_MD):
+        os.remove(RESULT_MD)
+
+
+# ---- status and settings ----
+
+def status():
+    cfg = load_config()
+    rows = [
+        (T["s_month"], f"${this_month()[0]:.2f}"),
+        (T["s_cap"], f"${num(cfg['max_per_message'], 10.0):.2f}"),
+        (T["s_model"], cfg.get("model") or "auto"),
+        (T["s_vscode"], T["s_on"] if vscode_enabled() else T["s_off"]),
+        (T["s_key"], T["s_saved"] if read_key() else T["s_missing"]),
+        (T["s_console"], BILLING_URL),
+    ]
+    print(T["s_title"] + "\n")
+    for name, value in rows:
+        print(f"  {name}: {value}")
+    if cfg.get("model") == "fable":
+        print("\n  " + T["s_fable"])
+    print("\n" + T["see_help"])
+
+
+def guide():
+    print(T["guide"] + "".join("  " + line + "\n" for line in T["help"].splitlines()) + T["guide_end"], end="")
+
+
+def delete_key():
+    if not read_key():
+        return False
+    if WIN:
+        keyring().delete_password(SERVICE, getpass.getuser())
+    else:
+        subprocess.run(["security", "delete-generic-password", "-a", getpass.getuser(), "-s", SERVICE],
+                       capture_output=True)
+    return not read_key()
+
+
+def uninstall():
+    if input(T["un_confirm"]).strip().lower() not in ("y", "yes"):
+        return print(T["un_none"])
+    had_rule, had_md = vscode_enabled(), os.path.exists(RESULT_MD)
+    vscode_off()  # only the marked block; the rest of CLAUDE.md stays
+    gone = ([T["un_rule"]] if had_rule else []) + ([RESULT_MD] if had_md else [])
+    for d in (CREDIT_DIR, os.path.dirname(log_path())):
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+            if not os.path.isdir(d):
+                gone.append(d)
+    if delete_key():
+        gone.append(T["un_key"])
+    bin_dir = os.path.join(os.path.expanduser("~"), ".local", "bin")
+    for name in ("credit", "credit.py", "credit.cmd"):
+        path = os.path.join(bin_dir, name)
+        if os.path.isfile(path):
+            os.remove(path)
+            gone.append(path)
+    print(T["un_done"] if gone else T["un_none"])
+    for g in gone:
+        print("  " + g)
+
+
+def set_value(args):
+    names = {"cap": "max_per_message", "model": "model"}
+    if len(args) != 2 or args[0] not in names:
+        sys.exit(T["set_usage"])
+    name, value = names[args[0]], args[1]
+    if name == "model":
+        if value not in ("auto", *MODELS):
+            sys.exit(T["set_usage"])
+    else:
+        try:
+            value = float(value)
+        except ValueError:
+            sys.exit(T["set_usage"])
+    cfg = load_config()
+    cfg[name] = value
+    save_config(cfg)
+    print(T["set_done"].format(name, value))
+
+
+def main():
+    args = sys.argv[1:]
+    sub = args[0] if args else ""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")  # a Windows console can't print every character
+    if sub == "--take":
+        return take()
+    if sub == "":
+        return status()
+    if sub == "key":
+        return set_key()
+    if sub == "set":
+        return set_value(args[1:])
+    if sub == "run":
+        return run(args[1:])
+    if sub in ("help", "-h", "--help"):
+        return guide()
+    if sub == "uninstall":
+        return uninstall()
+    if sub == "_install-vscode":  # called by install.sh / install.ps1
+        return vscode_on()
+    print(T["help"], end="")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print()
